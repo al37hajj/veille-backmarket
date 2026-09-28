@@ -13,9 +13,11 @@ Réglages (variables d'environnement) :
   MODE_TEST    facultatif  : "true" pour recevoir un récapitulatif même sans offre
 
 Pourquoi un vrai navigateur : sur une fiche Back Market, le prix affiché à côté
-d'un état peut appartenir à une autre configuration (autre SIM, autre stockage).
-Le script clique donc sur l'état et relit la fiche pour vérifier ce qui est
-réellement proposé avant d'alerter.
+d'un état appartient souvent à une autre configuration (ex. un 128 Go eSIM moins
+cher). Le script clique donc sur l'état, relit ce qui est réellement proposé et,
+si ce n'est pas la bonne config, remet « 256 Go » puis « SIM physique + eSIM »
+pour trouver le vrai prix de la bonne version. Il n'alerte que sur une offre
+dont le récapitulatif confirme état, stockage et SIM.
 """
 
 import json
@@ -36,6 +38,9 @@ ETATS_VOULUS = ("Très bon état", "Parfait état")
 TOUS_LES_ETATS = ("État correct", "Très bon état", "Parfait état", "Premium")
 STOCKAGE = "256 Go"
 SIM = "SIM physique + eSIM"
+COULEURS = ("Titane noir", "Titane naturel", "Titane sable", "Titane blanc")
+SIMS = ("SIM physique + eSIM", "Double SIM physique", "eSIM")  # du plus précis au plus court
+MOTIF_STOCKAGE = r"\b(128|256|512|1000) Go\b"
 
 # Fiches des 4 coloris en 256 Go « SIM physique + eSIM » (modèle européen)
 PRODUITS = {
@@ -76,26 +81,41 @@ def euros(valeur):
     return f"{valeur:,.2f} €".replace(",", " ").replace(".", ",")
 
 
-def prix_du_selecteur(texte):
-    """Prix affichés dans le sélecteur « Sélectionnez l'état » : {état: prix}."""
-    debut = texte.find("Sélectionnez l'état")
-    zone = texte[debut:debut + 1500] if debut >= 0 else texte
+def prix_de_la_zone(texte, titre_zone, libelles, repli=False):
+    """Prix affichés à côté de chaque option d'un sélecteur : {option: prix}."""
+    debut = texte.find(titre_zone)
+    if debut < 0:
+        if not repli:
+            return {}
+        zone = texte
+    else:
+        fins = [i for i in (texte.find("Sélectionnez", debut + len(titre_zone)),
+                            texte.find("avant reprise", debut)) if i > 0]
+        zone = texte[debut:min(fins + [debut + 1500])]
     reperes = [(m.start(), m.group(0))
-               for m in re.finditer("|".join(map(re.escape, TOUS_LES_ETATS)), zone)]
+               for m in re.finditer("|".join(map(re.escape, libelles)), zone)]
     prix = {}
-    for i, (pos, etat) in enumerate(reperes):
+    for i, (pos, libelle) in enumerate(reperes):
         fin = reperes[i + 1][0] if i + 1 < len(reperes) else len(zone)
-        morceau = zone[pos + len(etat):fin][:60]  # jamais au-delà de l'état suivant
+        morceau = zone[pos + len(libelle):fin][:60]  # jamais au-delà de l'option suivante
         m = re.search(MOTIF_PRIX, morceau)
-        if m and etat not in prix:
-            prix[etat] = en_euros(m.group(1))
+        if m and libelle not in prix:
+            prix[libelle] = en_euros(m.group(1))
     return prix
+
+
+def prix_du_selecteur(texte):
+    return prix_de_la_zone(texte, "Sélectionnez l'état", TOUS_LES_ETATS, repli=True)
+
+
+def prix_des_coloris(texte):
+    return prix_de_la_zone(texte, "Sélectionnez une couleur", COULEURS)
 
 
 # --- Navigation --------------------------------------------------------------
 
-JS_REPERER_ETAT = r"""
-(etat) => {
+JS_REPERER_OPTION = r"""
+([etat, exclureSIM]) => {
   const norm = s => (s || '').normalize('NFC').replace(/\u2019/g, "'")
                              .replace(/[\s\u00a0\u202f]+/g, ' ').trim();
   const prix = /\d{1,3}(?:[\s\u00a0\u202f]?\d{3})*,\d{2}[\s\u00a0\u202f]*€/;
@@ -109,7 +129,7 @@ JS_REPERER_ETAT = r"""
     for (let n = marche.currentNode.parentElement, i = 0; n && i < 7; n = n.parentElement, i++) {
       if (!visible(n)) break;
       const t = norm(n.innerText);
-      if (!t.startsWith(etat) || t.length > 90 || t.includes('SIM')) break;
+      if (!t.startsWith(etat) || t.length > 90 || (exclureSIM && t.includes('SIM'))) break;
       if (prix.test(t)) { cible = n; break; }
     }
   }
@@ -262,10 +282,11 @@ def attendre_changement(page, avant, secondes):
     return None
 
 
-def cliquer_etat(page, etat):
-    """Clique sur l'état voulu. Renvoie (infos, méthode, changement observé)."""
+def cliquer_option(page, libelle):
+    """Clique sur une option d'un sélecteur (état, stockage, SIM ou coloris).
+    Renvoie (infos, méthode, changement observé)."""
     try:
-        infos = page.evaluate(JS_REPERER_ETAT, etat)
+        infos = page.evaluate(JS_REPERER_OPTION, [libelle, libelle in TOUS_LES_ETATS])
     except Exception:
         infos = None
     if not infos:
@@ -290,82 +311,154 @@ def cliquer_etat(page, etat):
         try:
             fenetre = page.locator('[role="dialog"]:visible, [aria-modal="true"]:visible').first
             if fenetre.count():
-                changement_txt = normaliser(fenetre.inner_text(timeout=2000))[:160]
-                print(f"      fenêtre ouverte après le clic : « {changement_txt} »")
+                texte = normaliser(fenetre.inner_text(timeout=2000))[:160]
+                print(f"      fenêtre ouverte après le clic : « {texte} »")
         except Exception:
             pass
     return infos, methode, changement
 
 
-def lire_offre(page, etat, prix_affiche):
-    """Relit la fiche après le clic et vérifie état, stockage, SIM et prix."""
+def lire_config(page):
+    """Ce que la fiche propose vraiment : état, stockage, SIM, coloris, prix.
+    Source principale : le récapitulatif « État · Batterie · 256 Go · SIM · Coloris · prix »."""
     vue = instantane(page)
-    titre, blocs, prix_entete = vue["titre"], vue["blocs"], vue["entete"]
-    # Bloc récapitulatif : « État · Batterie · 256 Go · SIM physique + eSIM · Coloris · prix »
-    resume = next(((p, avant) for p, avant in blocs
-                   if etat in avant and STOCKAGE in avant and SIM in avant), None)
-    config_titre = STOCKAGE in titre and SIM in titre
-    if resume:
-        prix, certitude = resume[0], "confirmé"
-    elif (config_titre and prix_entete is not None and prix_affiche is not None
-          and abs(prix_entete - prix_affiche) < 0.005):
-        prix, certitude = prix_entete, "probable"
-    else:
-        prix, certitude = None, "autre configuration"
-    couleur = re.search(r"Titane (noir|naturel|sable|blanc)",
-                        titre + " " + (resume[1] if resume else ""), re.I)
+    titre, blocs = vue["titre"], vue["blocs"]
+    motif_etats = "|".join(map(re.escape, TOUS_LES_ETATS))
+    recap = None
+    for prix, avant in blocs:
+        if re.search(motif_etats, avant) and re.search(MOTIF_STOCKAGE, avant):
+            recap = (prix, avant)
+    source = recap[1] if recap else titre
+    etat = re.search(motif_etats, recap[1]).group(0) if recap else None
+    stockage = re.search(MOTIF_STOCKAGE, source)
+    couleur = re.search(r"Titane (noir|naturel|sable|blanc)", source, re.I)
     return {
-        "etat": etat, "affiche": prix_affiche, "prix": prix, "certitude": certitude,
+        "etat": etat,
+        "stockage": f"{stockage.group(1)} Go" if stockage else None,
+        "sim": next((x for x in SIMS if x in source), None),
         "couleur": couleur.group(0).capitalize() if couleur else None,
-        "titre": titre, "url": page.url, "entete": prix_entete,
-        "recap": blocs[-1][1][-110:] if blocs else "",
+        "prix": recap[0] if recap else vue["entete"],
+        "certain": recap is not None,
+        "titre": titre, "url": page.url,
+        "recap": recap[1][-110:] if recap else "",
     }
 
 
-def verifier_coloris(page, couleur, url):
-    r = {"couleur": couleur, "url": url, "statut": "", "selecteur": {}, "offres": []}
+def bonne_config(cfg):
+    return cfg["stockage"] == STOCKAGE and cfg["sim"] == SIM
+
+
+def est_cible(cfg, etat):
+    return bonne_config(cfg) and cfg["etat"] == etat
+
+
+def decrire(cfg):
+    sim = {"SIM physique + eSIM": "SIM + eSIM"}.get(cfg["sim"], cfg["sim"] or "?")
+    return (f"{cfg['etat'] or '?'}, {cfg['stockage'] or '?'} {sim}, "
+            f"{cfg['couleur'] or '?'}, {euros(cfg['prix'])}")
+
+
+def ajuster(page, etat, cfg):
+    """Back Market a proposé une autre config (ex. 128 Go eSIM) : on remet 256 Go puis
+    « SIM physique + eSIM » en gardant l'état, pour voir si la bonne version existe."""
+    etapes = []
+    for libelle, champ in ((STOCKAGE, "stockage"), (SIM, "sim")):
+        if cfg[champ] == libelle:
+            continue
+        infos, _, changement = cliquer_option(page, libelle)
+        if not infos or not changement:
+            etapes.append(f"{libelle} : option introuvable ou sans effet")
+            break
+        cfg = lire_config(page)
+        etapes.append(f"{libelle} → {decrire(cfg)}")
+    if bonne_config(cfg) and cfg["etat"] != etat:  # l'état a pu sauter : on le redemande
+        infos, _, changement = cliquer_option(page, etat)
+        if infos and changement:
+            cfg = lire_config(page)
+            etapes.append(f"{etat} → {decrire(cfg)}")
+    trouvees = []
+    if est_cible(cfg, etat):
+        trouvees.append(cfg)
+        # Les autres coloris dans cette config : on vérifie ceux affichés sous le plafond
+        for couleur, prix in prix_des_coloris(normaliser(page.inner_text("body"))).items():
+            if couleur == cfg["couleur"] or prix > PRIX_MAX:
+                continue
+            infos, _, changement = cliquer_option(page, couleur)
+            if infos and changement:
+                autre = lire_config(page)
+                etapes.append(f"{couleur} → {decrire(autre)}")
+                if est_cible(autre, etat):
+                    trouvees.append(autre)
+    for e in etapes:
+        print(f"      ajustement : {e}")
+    return {"offres": trouvees, "etapes": etapes}
+
+
+def verdict_bonne_config(cfg, couleur_fiche):
+    autre = f" ({cfg['couleur']})" if cfg["couleur"] and cfg["couleur"] != couleur_fiche else ""
+    if cfg["prix"] is not None and cfg["prix"] <= PRIX_MAX:
+        return f"{euros(cfg['prix'])} ✓{autre}"
+    return f"{euros(cfg['prix'])} bonne config mais trop cher{autre}"
+
+
+def verifier_coloris(page, couleur, url, ajustements):
+    r = {"couleur": couleur, "url": url, "statut": "", "selecteur": {}, "offres": [],
+         "verdicts": {}, "defaut": None}
     r["statut"] = ouvrir(page, url)
     if r["statut"] != "ok":
         return r
     texte = normaliser(page.inner_text("body"))
-    r["selecteur"] = prix_du_selecteur(texte)
-    sel = r["selecteur"]
-    if sel:
-        print(f"  affiché : Très bon {euros(sel.get('Très bon état'))}, "
-              f"Parfait {euros(sel.get('Parfait état'))}")
-    if not r["selecteur"]:
+    r["selecteur"] = sel = prix_du_selecteur(texte)
+    if not sel:
         r["statut"] = "prix introuvables"
         i = texte.find("Sélectionnez")
         print("    Extrait de la page :", texte[max(0, i):i + 600] if i >= 0 else texte[:600])
         return r
+    r["defaut"] = depart = lire_config(page)
+    print(f"  fiche : {decrire(depart)} | affiché : Très bon {euros(sel.get('Très bon état'))}, "
+          f"Parfait {euros(sel.get('Parfait état'))}")
+    if depart["etat"] in ETATS_VOULUS and est_cible(depart, depart["etat"]):
+        r["offres"].append(depart)
+        r["verdicts"][depart["etat"]] = verdict_bonne_config(depart, couleur)
 
-    premiere = True
+    fraiche = True
     for etat in ETATS_VOULUS:
-        affiche = r["selecteur"].get(etat)
-        if affiche is None or affiche > PRIX_MAX:
+        if etat in r["verdicts"]:
             continue
-        if not premiere:  # repartir de la fiche d'origine
+        affiche = sel.get(etat)
+        if affiche is None:
+            r["verdicts"][etat] = "déjà vendu"
+            continue
+        if affiche > PRIX_MAX:  # Back Market affiche le moins cher : rien en dessous
+            r["verdicts"][etat] = f"{euros(affiche)} affiché, trop cher"
+            continue
+        if not fraiche:  # repartir de la fiche d'origine
             pause(2, 4)
             if ouvrir(page, url) != "ok":
                 break
-        premiere = False
-        infos, methode, changement = cliquer_etat(page, etat)
-        if infos is None:
-            offre = {"etat": etat, "affiche": affiche, "prix": None, "couleur": None,
-                     "certitude": "option introuvable", "titre": "", "url": page.url,
-                     "entete": None, "recap": ""}
-        else:
-            offre = lire_offre(page, etat, affiche)
-            if not changement and offre["certitude"] != "confirmé":
-                offre["certitude"] = "clic sans effet"
-        r["offres"].append(offre)
-        print(f"    {etat} (affiché {euros(affiche)}) : {methode or '—'} → "
-              f"{changement or 'aucun changement'} ⇒ {euros(offre['prix'])} ({offre['certitude']})")
-        if offre["certitude"] not in ("confirmé", "probable"):
-            if infos:
-                print(f"      élément cliqué : {infos['chaine']}")
-            print(f"      après : titre « {offre['titre']} » | en-tête {euros(offre['entete'])} "
-                  f"| récap « {offre['recap']} » | {offre['url']}")
+        fraiche = False
+        infos, methode, changement = cliquer_option(page, etat)
+        if not infos:
+            r["verdicts"][etat] = "option introuvable"
+            continue
+        cfg = lire_config(page)
+        if (not cfg["certain"] and bonne_config(cfg) and cfg["prix"] is not None
+                and abs(cfg["prix"] - affiche) < 0.005):
+            cfg["etat"] = etat  # pas de récapitulatif lisible : titre + prix concordants
+        print(f"    {etat} (affiché {euros(affiche)}) : {methode} → "
+              f"{changement or 'aucun changement'} ⇒ {decrire(cfg)}")
+        if est_cible(cfg, etat):
+            r["offres"].append(cfg)
+            r["verdicts"][etat] = verdict_bonne_config(cfg, couleur)
+            continue
+        if not changement:
+            r["verdicts"][etat] = "clic sans effet"
+            print(f"      élément cliqué : {infos['chaine']}")
+            continue
+        sim = {"SIM physique + eSIM": "SIM + eSIM"}.get(cfg["sim"], cfg["sim"] or "?")
+        r["verdicts"][etat] = f"{euros(cfg['prix'])} = {cfg['stockage'] or '?'} {sim}"
+        if etat not in ajustements:  # une seule recherche par état et par passage
+            ajustements[etat] = ajuster(page, etat, cfg)
     return r
 
 
@@ -395,7 +488,7 @@ def verifier():
     except ImportError:
         print("❌ Playwright manque : lancez « pip install playwright ».")
         sys.exit(1)
-    resultats = {}
+    resultats, ajustements = {}, {}
     with sync_playwright() as p:
         navigateur, contexte = lancer_chrome(p)
         page = contexte.new_page()
@@ -412,15 +505,16 @@ def verifier():
                     pause(3, 7)
                 print(f"- {couleur}")
                 try:
-                    r = verifier_coloris(page, couleur, url)
+                    r = verifier_coloris(page, couleur, url, ajustements)
                 except Exception as e:
                     r = {"couleur": couleur, "url": url, "selecteur": {}, "offres": [],
+                         "verdicts": {}, "defaut": None,
                          "statut": f"erreur ({type(e).__name__}: {str(e)[:120]})"}
                 resultats[couleur] = r
                 if r["statut"] != "ok":
                     print(f"  ⇒ {r['statut']}")
         navigateur.close()
-    return [resultats[c] for c, _ in PRODUITS.items()]
+    return [resultats[c] for c, _ in PRODUITS.items()], ajustements
 
 
 # --- Notifications -----------------------------------------------------------
@@ -471,23 +565,41 @@ def charger_memoire():
         return {}
 
 
-def resume_github(resultats, trouvees):
+ABREGE = {"Très bon état": "Très bon", "Parfait état": "Parfait"}
+
+
+def lignes_bilan(resultats, ajustements):
+    """Bilan lisible, par coloris puis pour la recherche en 256 Go SIM physique + eSIM."""
+    lignes = []
+    for r in resultats:
+        if r["statut"] != "ok":
+            lignes.append(f"{r['couleur']} : {r['statut']}")
+            continue
+        details = [f"{ABREGE[e]} {r['verdicts'].get(e, '—')}" for e in ETATS_VOULUS]
+        d = r["defaut"]
+        fiche = f" (fiche : {d['etat']} {euros(d['prix'])})" if d and d["etat"] else ""
+        lignes.append(f"{r['couleur']}{fiche} : " + " ; ".join(details))
+    verifiees = [o for r in resultats for o in r["offres"]]
+    verifiees += [o for a in ajustements.values() for o in a["offres"]]
+    for etat in ETATS_VOULUS:
+        bonnes = [o for o in verifiees if est_cible(o, etat) and o["prix"] is not None]
+        if bonnes:
+            o = min(bonnes, key=lambda o: o["prix"])
+            txt = f"{euros(o['prix'])} ({o['couleur'] or '?'})"
+        else:
+            txt = "aucune trouvée"
+        lignes.append(f"Meilleur {ABREGE[etat]} en {STOCKAGE} {SIM} : {txt}")
+    return lignes
+
+
+def resume_github(resultats, ajustements, trouvees):
     chemin = os.environ.get("GITHUB_STEP_SUMMARY")
     if not chemin:
         return
-    lignes = [
-        "### Veille Back Market", "",
-        f"Cible : iPhone 16 Pro {STOCKAGE}, {SIM}, Très bon ou Parfait état, "
-        f"{euros(PRIX_MAX)} maximum.", "",
-        "| Coloris | Lecture | Très bon (affiché) | Parfait (affiché) | Vérification |",
-        "|---|---|---|---|---|",
-    ]
-    for r in resultats:
-        sel = r["selecteur"]
-        verif = "; ".join(f"{o['etat']} : {euros(o['prix'])} ({o['certitude']})"
-                          for o in r["offres"]) or "—"
-        lignes.append(f"| {r['couleur']} | {r['statut']} | {euros(sel.get('Très bon état'))} "
-                      f"| {euros(sel.get('Parfait état'))} | {verif} |")
+    lignes = ["### Veille Back Market", "",
+              f"Cible : iPhone 16 Pro {STOCKAGE}, {SIM}, Très bon ou Parfait état, "
+              f"{euros(PRIX_MAX)} maximum.", ""]
+    lignes += [f"- {l}" for l in lignes_bilan(resultats, ajustements)]
     lignes += ["", f"Offres valides : {len(trouvees)}"]
     with open(chemin, "a", encoding="utf-8") as f:
         f.write("\n".join(lignes) + "\n")
@@ -505,21 +617,22 @@ def main():
     avant = json.dumps(memoire, sort_keys=True)
     deja = set(memoire.get("actives", []))
 
-    resultats = verifier()
+    resultats, ajustements = verifier()
 
+    # Toutes les offres dont la config a été vérifiée (fiches + ajustements)
     trouvees = {}
-    for r in resultats:
-        for o in r["offres"]:
-            if o["prix"] is not None and o["prix"] <= PRIX_MAX:
-                couleur = o["couleur"] or r["couleur"]
-                cle = f"{couleur}|{o['etat']}|{o['prix']:.2f}"
-                trouvees[cle] = dict(o, couleur=couleur)
+    offres = [o for r in resultats for o in r["offres"]]
+    offres += [o for a in ajustements.values() for o in a["offres"]]
+    for o in offres:
+        if o["prix"] is not None and o["prix"] <= PRIX_MAX and est_cible(o, o["etat"]):
+            couleur = o["couleur"] or "?"
+            trouvees[f"{couleur}|{o['etat']}|{o['prix']:.2f}"] = dict(o, couleur=couleur)
 
     # Alerte uniquement pour les offres nouvelles (ou revenues après disparition)
     for cle, o in sorted(trouvees.items(), key=lambda kv: kv[1]["prix"]):
         if cle in deja:
             continue
-        verif = ("Prix vérifié sur la fiche." if o["certitude"] == "confirmé"
+        verif = ("Config vérifiée sur la fiche." if o["certain"]
                  else "Vérifiez l'état et la SIM sur la fiche avant de payer.")
         notifier(f"iPhone 16 Pro à {euros(o['prix'])} sur Back Market",
                  f"{o['etat']}, {o['couleur']}, {STOCKAGE}, {SIM}\n{verif}",
@@ -544,35 +657,17 @@ def main():
                      tags=["white_check_mark"])
         memoire["panne_signalee"] = False
 
+    bilan = lignes_bilan(resultats, ajustements)
+    print("Bilan :\n  " + "\n  ".join(bilan))
     if MODE_TEST:
-        abrege = {"Très bon état": "Très bon", "Parfait état": "Parfait"}
-        lignes = []
-        for r in resultats:
-            if r["statut"] != "ok":
-                lignes.append(f"{r['couleur']} : {r['statut']}")
-                continue
-            sel = r["selecteur"]
-            details = []
-            for etat in ETATS_VOULUS:
-                o = next((o for o in r["offres"] if o["etat"] == etat), None)
-                affiche = euros(sel.get(etat))
-                if o is None:
-                    details.append(f"{abrege[etat]} {affiche}")
-                elif o["certitude"] in ("confirmé", "probable"):
-                    details.append(f"{abrege[etat]} {euros(o['prix'])} ✓")
-                else:
-                    details.append(f"{abrege[etat]} {affiche} ({o['certitude']})")
-            lignes.append(f"{r['couleur']} : " + ", ".join(details))
-        if trouvees:
-            lignes.append("\nOffres vérifiées : " + ", ".join(
-                f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values()))
-        else:
-            lignes.append(f"\nAucune offre vérifiée à {euros(PRIX_MAX)} ou moins.")
+        conclusion = (f"\nOffres valides : " + ", ".join(
+            f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values())
+            if trouvees else f"\nAucune offre valide à {euros(PRIX_MAX)} ou moins.")
         lues = sum(r["statut"] == "ok" for r in resultats)
-        notifier(f"Test : {lues}/{len(resultats)} fiches lues", "\n".join(lignes),
+        notifier(f"Test : {lues}/{len(resultats)} fiches lues", "\n".join(bilan) + conclusion,
                  priorite=3, tags=["test_tube"])
 
-    resume_github(resultats, trouvees)
+    resume_github(resultats, ajustements, trouvees)
     FICHIER_MEMOIRE.write_text(json.dumps(memoire, ensure_ascii=False, indent=1), encoding="utf-8")
     change = json.dumps(memoire, sort_keys=True) != avant
     if os.environ.get("GITHUB_OUTPUT"):
