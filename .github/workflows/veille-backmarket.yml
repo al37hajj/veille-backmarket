@@ -1,0 +1,59 @@
+# À placer dans le dépôt sous : .github/workflows/veille-backmarket.yml
+name: Veille Back Market
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # toutes les 30 minutes
+  workflow_dispatch:          # bouton « Run workflow » pour tester
+    inputs:
+      test:
+        description: "Envoyer un récapitulatif même sans bonne affaire"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veille-backmarket
+  cancel-in-progress: false
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Installer Playwright
+        run: |
+          pip install --quiet playwright
+          command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+          command -v google-chrome >/dev/null || python -m playwright install --with-deps chromium
+
+      - name: Récupérer la mémoire des alertes déjà envoyées
+        uses: actions/cache/restore@v6
+        with:
+          path: state.json
+          key: veille-${{ github.run_id }}
+          restore-keys: veille-
+
+      - name: Vérifier Back Market
+        id: veille
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_EMAIL: ${{ secrets.NTFY_EMAIL }}
+          PRIX_MAX: "760"
+          MODE_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+        run: xvfb-run -a python watch.py
+
+      - name: Sauvegarder la mémoire des alertes
+        if: always() && steps.veille.outputs.changed == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: state.json
+          key: veille-${{ github.run_id }}-${{ github.run_attempt }}
