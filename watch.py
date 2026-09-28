@@ -94,29 +94,48 @@ def prix_du_selecteur(texte):
 
 # --- Navigation --------------------------------------------------------------
 
-JS_CLIC_ETAT = r"""
+JS_REPERER_ETAT = r"""
 (etat) => {
   const norm = s => (s || '').normalize('NFC').replace(/\u2019/g, "'")
                              .replace(/[\s\u00a0\u202f]+/g, ' ').trim();
   const prix = /\d{1,3}(?:[\s\u00a0\u202f]?\d{3})*,\d{2}[\s\u00a0\u202f]*€/;
-  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const candidats = Array.from(document.querySelectorAll(
-    'button, [role="radio"], [role="option"], [role="button"], a, label, li'
-  )).filter(el => {
-    const t = norm(el.innerText);
-    return t.startsWith(etat) && t.length < 150 && prix.test(t);
-  });
-  if (!candidats.length) return null;
-  candidats.sort((a, b) =>
-    (visible(b) - visible(a)) ||
-    ((b.tagName === 'BUTTON') - (a.tagName === 'BUTTON')) ||
-    (norm(a.innerText).length - norm(b.innerText).length));
-  const el = candidats[0];
-  el.scrollIntoView({block: 'center'});
-  el.click();
-  return norm(el.innerText);
+  const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  document.querySelectorAll('[data-veille-cible]').forEach(e => e.removeAttribute('data-veille-cible'));
+  const marche = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let cible = null;
+  while (!cible && marche.nextNode()) {
+    if (!norm(marche.currentNode.nodeValue).startsWith(etat)) continue;
+    // Remonter jusqu'au plus petit bloc qui contient l'état ET un prix (l'option du sélecteur)
+    for (let n = marche.currentNode.parentElement, i = 0; n && i < 7; n = n.parentElement, i++) {
+      if (!visible(n)) break;
+      const t = norm(n.innerText);
+      if (!t.startsWith(etat) || t.length > 90 || t.includes('SIM')) break;
+      if (prix.test(t)) { cible = n; break; }
+    }
+  }
+  if (!cible) return null;
+  const decrire = n => {
+    if (!n) return '';
+    const attrs = [...n.attributes]
+      .filter(a => /^(id|href|role|type|name|value|disabled|aria-[a-z]+|data-[a-z0-9-]+)$/.test(a.name))
+      .map(a => `${a.name}="${a.value.slice(0, 40)}"`).join(' ');
+    return `<${n.tagName.toLowerCase()}${attrs ? ' ' + attrs : ''}>`;
+  };
+  const chaine = [];
+  for (let n = cible, i = 0; n && i < 4; n = n.parentElement, i++) chaine.push(decrire(n));
+  const interactif = cible.closest(
+    'a[href],button,[role="radio"],[role="option"],[role="button"],[role="tab"],label,[tabindex]');
+  cible.setAttribute('data-veille-cible', 'bloc');
+  if (interactif && interactif !== cible) interactif.setAttribute('data-veille-cible', 'interactif');
+  return {texte: norm(cible.innerText), chaine: chaine.join(' < ')};
 }
 """
+
+JS_CLIC_SECOURS = """() => {
+  const el = document.querySelector('[data-veille-cible="interactif"]')
+          || document.querySelector('[data-veille-cible="bloc"]');
+  if (el) el.click();
+}"""
 
 
 def pause(mini, maxi):
@@ -144,76 +163,162 @@ def fermer_cookies(page):
             pass
 
 
+MARQUEURS_BLOCAGE = ("captcha-delivery.com", "datadome", "cf-chl", "challenge-platform",
+                     "just a moment", "attention required", "access denied", "accès refusé",
+                     "vous avez été bloqué", "enable js and disable any ad blocker")
+
+
+def est_fiche(html):
+    return "Sélectionnez" in html and "iPhone 16 Pro" in html
+
+
+def contenu(page):
+    try:
+        return page.content()
+    except Exception:  # page en cours de navigation
+        return ""
+
+
+def diagnostic(page, code):
+    try:
+        titre = page.title()
+    except Exception:
+        titre = "?"
+    try:
+        extrait = normaliser(page.inner_text("body"))[:200]
+    except Exception:
+        extrait = ""
+    return f"HTTP {code} | {page.url} | titre « {titre} » | texte : {extrait}"
+
+
 def ouvrir(page, url):
     """Charge une fiche. Renvoie "ok", "bloqué" ou "page inattendue"."""
     reponse = page.goto(url, wait_until="domcontentloaded", timeout=45000)
     code = reponse.status if reponse else 0
     patienter(page)
-    for tentative in range(2):
-        html = page.content()
-        fiche = "Sélectionnez" in html
-        bloque = not fiche and ("captcha-delivery.com" in html or code in (403, 429))
-        if not bloque:
-            break
-        if tentative == 0:  # laisser finir une éventuelle vérification automatique
-            page.wait_for_timeout(int(8000 * RYTHME))
-    if bloque:
-        return "bloqué"
-    if "iPhone 16 Pro" not in html:
-        return "page inattendue"
-    fermer_cookies(page)
-    return "ok"
+    html = contenu(page)
+    fin = time.time() + 20 * RYTHME  # une vérification anti-robot peut se résoudre seule
+    while not est_fiche(html) and time.time() < fin:
+        page.wait_for_timeout(2500)
+        html = contenu(page)
+    if est_fiche(html):
+        fermer_cookies(page)
+        return "ok"
+    bas = html.lower()
+    statut = ("bloqué" if code >= 400 or any(m in bas for m in MARQUEURS_BLOCAGE)
+              else "page inattendue")
+    print(f"    {statut} : {diagnostic(page, code)}")
+    return statut
 
 
-def cliquer_etat(page, etat):
+def echauffement(page):
+    """Visite l'accueil d'abord, comme un visiteur normal."""
+    accueil = os.environ.get("BM_ACCUEIL") or "https://www.backmarket.fr/fr-fr"
     try:
-        return page.evaluate(JS_CLIC_ETAT, etat)
+        page.goto(accueil, wait_until="domcontentloaded", timeout=45000)
+        patienter(page, 3)
+        fermer_cookies(page)
     except Exception as e:
-        message = str(e).lower()
-        if "context was destroyed" in message or "navigat" in message:
-            return "(navigation)"
-        return None
+        print(f"  (accueil injoignable : {str(e)[:100]})")
 
 
-def lire_offre(page, etat, prix_affiche, clic):
-    """Relit la fiche après le clic et vérifie état, stockage, SIM et prix."""
-    try:
-        titre = normaliser(page.locator("h1").first.inner_text(timeout=5000))
-    except Exception:
-        titre = ""
-    texte = normaliser(page.inner_text("body"))
-    # Chaque prix « … € avant reprise », avec seulement le texte qui le précède
-    # depuis le prix précédent (sinon on capterait les sélecteurs voisins)
+def blocs_prix(texte):
+    """Chaque prix « … € avant reprise », avec seulement le texte qui le précède
+    depuis le prix précédent (sinon on capterait les sélecteurs voisins)."""
     blocs = []
     for m in re.finditer(MOTIF_PRIX + " avant reprise", texte):
         debut = max(texte.rfind("€", 0, m.start()) + 1, m.start() - 200)
-        blocs.append((en_euros(m.group(1)), texte[debut:m.start()]))
+        blocs.append((en_euros(m.group(1)), texte[debut:m.start()].strip()))
+    return blocs
+
+
+def instantane(page):
+    try:
+        titre = normaliser(page.locator("h1").first.inner_text(timeout=2000))
+    except Exception:
+        titre = ""
+    try:
+        texte = normaliser(page.inner_text("body"))
+    except Exception:
+        texte = ""
+    blocs = blocs_prix(texte)
+    return {"url": page.url, "titre": titre, "blocs": blocs,
+            "entete": blocs[0][0] if blocs else None}
+
+
+def attendre_changement(page, avant, secondes):
+    fin = time.time() + secondes * max(RYTHME, 0.3)
+    while time.time() < fin:
+        page.wait_for_timeout(500)
+        apres = instantane(page)
+        if apres["url"] != avant["url"]:
+            return "page changée"
+        if apres["titre"] and apres["titre"] != avant["titre"]:
+            return "titre changé"
+        if apres["entete"] is not None and apres["entete"] != avant["entete"]:
+            return f"prix {euros(avant['entete'])} → {euros(apres['entete'])}"
+        if apres["blocs"] and apres["blocs"] != avant["blocs"]:
+            return "récapitulatif changé"
+    return None
+
+
+def cliquer_etat(page, etat):
+    """Clique sur l'état voulu. Renvoie (infos, méthode, changement observé)."""
+    try:
+        infos = page.evaluate(JS_REPERER_ETAT, etat)
+    except Exception:
+        infos = None
+    if not infos:
+        return None, "", None
+    avant = instantane(page)
+    try:
+        page.locator('[data-veille-cible="bloc"]').first.click(timeout=5000)
+        methode = "clic"
+    except Exception as e:
+        methode = f"clic refusé ({type(e).__name__})"
+    changement = attendre_changement(page, avant, 12)
+    if not changement:  # second essai : clic direct sur l'élément interactif
+        try:
+            page.evaluate(JS_CLIC_SECOURS)
+            methode += " + clic de secours"
+        except Exception:
+            pass
+        changement = attendre_changement(page, avant, 8)
+    if changement:
+        patienter(page, 2)
+    else:
+        try:
+            fenetre = page.locator('[role="dialog"]:visible, [aria-modal="true"]:visible').first
+            if fenetre.count():
+                changement_txt = normaliser(fenetre.inner_text(timeout=2000))[:160]
+                print(f"      fenêtre ouverte après le clic : « {changement_txt} »")
+        except Exception:
+            pass
+    return infos, methode, changement
+
+
+def lire_offre(page, etat, prix_affiche):
+    """Relit la fiche après le clic et vérifie état, stockage, SIM et prix."""
+    vue = instantane(page)
+    titre, blocs, prix_entete = vue["titre"], vue["blocs"], vue["entete"]
     # Bloc récapitulatif : « État · Batterie · 256 Go · SIM physique + eSIM · Coloris · prix »
     resume = next(((p, avant) for p, avant in blocs
                    if etat in avant and STOCKAGE in avant and SIM in avant), None)
-    prix_entete = blocs[0][0] if blocs else None
     config_titre = STOCKAGE in titre and SIM in titre
-
-    if clic is None:
-        prix, certitude = None, "clic impossible"
-    elif resume:
+    if resume:
         prix, certitude = resume[0], "confirmé"
     elif (config_titre and prix_entete is not None and prix_affiche is not None
           and abs(prix_entete - prix_affiche) < 0.005):
         prix, certitude = prix_entete, "probable"
     else:
         prix, certitude = None, "autre configuration"
-
     couleur = re.search(r"Titane (noir|naturel|sable|blanc)",
                         titre + " " + (resume[1] if resume else ""), re.I)
     return {
-        "etat": etat,
-        "affiche": prix_affiche,
-        "prix": prix,
-        "certitude": certitude,
+        "etat": etat, "affiche": prix_affiche, "prix": prix, "certitude": certitude,
         "couleur": couleur.group(0).capitalize() if couleur else None,
-        "titre": titre,
-        "url": page.url,
+        "titre": titre, "url": page.url, "entete": prix_entete,
+        "recap": blocs[-1][1][-110:] if blocs else "",
     }
 
 
@@ -224,6 +329,10 @@ def verifier_coloris(page, couleur, url):
         return r
     texte = normaliser(page.inner_text("body"))
     r["selecteur"] = prix_du_selecteur(texte)
+    sel = r["selecteur"]
+    if sel:
+        print(f"  affiché : Très bon {euros(sel.get('Très bon état'))}, "
+              f"Parfait {euros(sel.get('Parfait état'))}")
     if not r["selecteur"]:
         r["statut"] = "prix introuvables"
         i = texte.find("Sélectionnez")
@@ -240,9 +349,23 @@ def verifier_coloris(page, couleur, url):
             if ouvrir(page, url) != "ok":
                 break
         premiere = False
-        clic = cliquer_etat(page, etat)
-        patienter(page, 3)
-        r["offres"].append(lire_offre(page, etat, affiche, clic))
+        infos, methode, changement = cliquer_etat(page, etat)
+        if infos is None:
+            offre = {"etat": etat, "affiche": affiche, "prix": None, "couleur": None,
+                     "certitude": "option introuvable", "titre": "", "url": page.url,
+                     "entete": None, "recap": ""}
+        else:
+            offre = lire_offre(page, etat, affiche)
+            if not changement and offre["certitude"] != "confirmé":
+                offre["certitude"] = "clic sans effet"
+        r["offres"].append(offre)
+        print(f"    {etat} (affiché {euros(affiche)}) : {methode or '—'} → "
+              f"{changement or 'aucun changement'} ⇒ {euros(offre['prix'])} ({offre['certitude']})")
+        if offre["certitude"] not in ("confirmé", "probable"):
+            if infos:
+                print(f"      élément cliqué : {infos['chaine']}")
+            print(f"      après : titre « {offre['titre']} » | en-tête {euros(offre['entete'])} "
+                  f"| récap « {offre['recap']} » | {offre['url']}")
     return r
 
 
@@ -272,32 +395,41 @@ def verifier():
     except ImportError:
         print("❌ Playwright manque : lancez « pip install playwright ».")
         sys.exit(1)
-    resultats = []
+    resultats = {}
     with sync_playwright() as p:
         navigateur, contexte = lancer_chrome(p)
         page = contexte.new_page()
-        for i, (couleur, url) in enumerate(PRODUITS.items()):
-            if i:
-                pause(3, 7)
-            try:
-                r = verifier_coloris(page, couleur, url)
-            except Exception as e:
-                r = {"couleur": couleur, "url": url, "selecteur": {}, "offres": [],
-                     "statut": f"erreur ({type(e).__name__}: {str(e)[:120]})"}
-            resultats.append(r)
-            sel = r["selecteur"]
-            print(f"- {couleur} : {r['statut']}"
-                  + (f" | affiché : Très bon {euros(sel.get('Très bon état'))}, "
-                     f"Parfait {euros(sel.get('Parfait état'))}" if sel else ""))
-            for o in r["offres"]:
-                print(f"    {o['etat']} → {euros(o['prix'])} ({o['certitude']}) | {o['titre']}")
+        echauffement(page)
+        coloris = list(PRODUITS.items())
+        for passage in (1, 2):
+            a_faire = [(c, u) for c, u in coloris
+                       if passage == 1 or resultats[c]["statut"] != "ok"]
+            if passage == 2 and a_faire:
+                print(f"Nouvel essai pour : {', '.join(c for c, _ in a_faire)}")
+                pause(8, 15)
+            for i, (couleur, url) in enumerate(a_faire):
+                if i:
+                    pause(3, 7)
+                print(f"- {couleur}")
+                try:
+                    r = verifier_coloris(page, couleur, url)
+                except Exception as e:
+                    r = {"couleur": couleur, "url": url, "selecteur": {}, "offres": [],
+                         "statut": f"erreur ({type(e).__name__}: {str(e)[:120]})"}
+                resultats[couleur] = r
+                if r["statut"] != "ok":
+                    print(f"  ⇒ {r['statut']}")
         navigateur.close()
-    return resultats
+    return [resultats[c] for c, _ in PRODUITS.items()]
 
 
 # --- Notifications -----------------------------------------------------------
 
+EMAIL_REFUSE = False
+
+
 def notifier(titre, message, priorite=3, lien=None, tags=None):
+    global EMAIL_REFUSE
     if not NTFY_TOPIC:
         print(f"  (pas de NTFY_TOPIC, notification non envoyée : {titre})")
         return False
@@ -307,7 +439,8 @@ def notifier(titre, message, priorite=3, lien=None, tags=None):
     if lien:
         donnees["click"] = lien
         donnees["actions"] = [{"action": "view", "label": "Ouvrir Back Market", "url": lien}]
-    essais = [dict(donnees, email=NTFY_EMAIL), donnees] if NTFY_EMAIL else [donnees]
+    essais = ([dict(donnees, email=NTFY_EMAIL), donnees] if NTFY_EMAIL and not EMAIL_REFUSE
+              else [donnees])
     for n, corps in enumerate(essais):
         requete = urllib.request.Request(
             NTFY_SERVEUR + "/", data=json.dumps(corps).encode("utf-8"),
@@ -316,7 +449,9 @@ def notifier(titre, message, priorite=3, lien=None, tags=None):
             with urllib.request.urlopen(requete, timeout=20):
                 pass
             if n:
-                print("  E-mail refusé par ntfy : notification envoyée sans e-mail.")
+                EMAIL_REFUSE = True
+                print("  E-mail refusé par ntfy (compte requis) : notification envoyée sans e-mail. "
+                      "Vous pouvez supprimer le secret NTFY_EMAIL.")
             print(f"  Notification envoyée : {titre}")
             return True
         except urllib.error.HTTPError as e:
@@ -410,20 +545,32 @@ def main():
         memoire["panne_signalee"] = False
 
     if MODE_TEST:
-        lignes = ["Prix affichés sur chaque fiche (avant vérification de la config) :"]
+        abrege = {"Très bon état": "Très bon", "Parfait état": "Parfait"}
+        lignes = []
         for r in resultats:
+            if r["statut"] != "ok":
+                lignes.append(f"{r['couleur']} : {r['statut']}")
+                continue
             sel = r["selecteur"]
-            lignes.append(f"{r['couleur']} : " + (
-                f"Très bon {euros(sel.get('Très bon état'))}, Parfait {euros(sel.get('Parfait état'))}"
-                if r["statut"] == "ok" else r["statut"]))
+            details = []
+            for etat in ETATS_VOULUS:
+                o = next((o for o in r["offres"] if o["etat"] == etat), None)
+                affiche = euros(sel.get(etat))
+                if o is None:
+                    details.append(f"{abrege[etat]} {affiche}")
+                elif o["certitude"] in ("confirmé", "probable"):
+                    details.append(f"{abrege[etat]} {euros(o['prix'])} ✓")
+                else:
+                    details.append(f"{abrege[etat]} {affiche} ({o['certitude']})")
+            lignes.append(f"{r['couleur']} : " + ", ".join(details))
         if trouvees:
-            lignes.append(f"\nOffres vérifiées à {euros(PRIX_MAX)} ou moins : " + ", ".join(
+            lignes.append("\nOffres vérifiées : " + ", ".join(
                 f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values()))
         else:
-            lignes.append(f"\nAucune offre vérifiée à {euros(PRIX_MAX)} ou moins pour l'instant.")
-        notifier("Test réussi : la veille lit Back Market" if not aucune_lue
-                 else "Test : Back Market bloque la vérification",
-                 "\n".join(lignes), priorite=3, tags=["test_tube"])
+            lignes.append(f"\nAucune offre vérifiée à {euros(PRIX_MAX)} ou moins.")
+        lues = sum(r["statut"] == "ok" for r in resultats)
+        notifier(f"Test : {lues}/{len(resultats)} fiches lues", "\n".join(lignes),
+                 priorite=3, tags=["test_tube"])
 
     resume_github(resultats, trouvees)
     FICHIER_MEMOIRE.write_text(json.dumps(memoire, ensure_ascii=False, indent=1), encoding="utf-8")
