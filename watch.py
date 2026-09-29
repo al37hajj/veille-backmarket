@@ -605,26 +605,38 @@ def appel_http(url, donnees=None, timeout=20):
 
 def trouver_chat_telegram(memoire):
     """Identifiant de la conversation : secret, sinon mémoire, sinon dernier message reçu par le bot."""
+    base = f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}"
+    code, moi = appel_http(f"{base}/getMe")
+    if code == 401:
+        print("❌ Telegram refuse le jeton : vérifiez le secret TELEGRAM_TOKEN "
+              "(tout copier, sans espace ni « ? »).")
+        return None, "jeton refusé"
+    bot = "@" + (moi.get("result") or {}).get("username", "?")
+    CANAUX["bot"] = bot
+    print(f"Telegram : le jeton correspond au bot {bot}")
     if TELEGRAM_CHAT_ID:
         return TELEGRAM_CHAT_ID, "secret"
     if memoire.get("telegram_chat_id"):
         return str(memoire["telegram_chat_id"]), "mémoire"
-    code, rep = appel_http(f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/getUpdates")
-    if code == 401:
-        print("❌ Telegram refuse le jeton : vérifiez le secret TELEGRAM_TOKEN.")
-        return None, "jeton refusé"
+    code, rep = appel_http(f"{base}/getUpdates")
+    if code == 409:  # un « webhook » empêche de lire les messages : on le retire
+        appel_http(f"{base}/deleteWebhook")
+        code, rep = appel_http(f"{base}/getUpdates")
+    if code != 200:
+        print(f"  Telegram getUpdates a répondu {code} : {str(rep.get('description', rep))[:150]}")
     for maj in reversed(rep.get("result") or []):
-        message = maj.get("message") or maj.get("my_chat_member") or {}
-        chat = message.get("chat") or {}
-        if chat.get("id") is not None:
-            memoire["telegram_chat_id"] = chat["id"]
-            return str(chat["id"]), "trouvé"
-    print("❌ Telegram : aucun message reçu par le bot. Ouvrez votre bot, touchez « Démarrer » "
-          "(ou envoyez-lui un message), puis relancez.")
+        for champ in ("message", "edited_message", "my_chat_member", "callback_query"):
+            contenu = maj.get(champ) or {}
+            chat = contenu.get("chat") or (contenu.get("message") or {}).get("chat") or {}
+            if chat.get("id") is not None:
+                memoire["telegram_chat_id"] = chat["id"]
+                return str(chat["id"]), "trouvé"
+    print(f"❌ Telegram : le bot {bot} n'a reçu aucun message ces dernières 24 h. Dans Telegram, "
+          f"cherchez {bot} (pas BotFather), envoyez-lui « salut », puis relancez.")
     return None, "introuvable"
 
 
-CANAUX = {"telegram": None}  # rempli par main() : identifiant de conversation Telegram
+CANAUX = {"telegram": None, "bot": "votre bot"}  # rempli par main()
 
 
 def envoyer_telegram(titre, message, lien=None, silencieux=False):
@@ -638,8 +650,14 @@ def envoyer_telegram(titre, message, lien=None, silencieux=False):
         donnees["reply_markup"] = {"inline_keyboard": [[{"text": "Ouvrir Back Market", "url": lien}]]}
     code, rep = appel_http(f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage", donnees)
     if code == 200 and rep.get("ok"):
+        CANAUX["livre"] = True
         return True
-    print(f"  Telegram a répondu {code} : {str(rep.get('description', rep))[:200]}")
+    description = str(rep.get("description", rep))
+    print(f"  Telegram a répondu {code} : {description[:200]}")
+    if code in (400, 403) and ("chat not found" in description or "initiate" in description
+                               or "blocked" in description):
+        print(f"  → Ouvrez {CANAUX['bot']} dans Telegram et touchez « Démarrer » "
+              "(ou débloquez-le), puis relancez.")
     return False
 
 
@@ -837,8 +855,8 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
             f.write(f"changed={'true' if change else 'false'}\n")
     print(f"Terminé : {len(trouvees)} offre(s) valide(s).")
-    if TELEGRAM_TOKEN and not CANAUX.get("telegram") and MODE_TEST:
-        sys.exit(1)  # test en rouge : Telegram n'est pas encore relié
+    if TELEGRAM_TOKEN and MODE_TEST and not CANAUX.get("livre"):
+        sys.exit(1)  # test en rouge : rien n'est arrivé sur Telegram (voir le message ❌ plus haut)
 
 
 if __name__ == "__main__":
