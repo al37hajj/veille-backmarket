@@ -3,23 +3,27 @@
 Veille Back Market : iPhone 16 Pro 256 Go, « SIM physique + eSIM »,
 Très bon état ou Parfait état, à 760 € ou moins (tous coloris).
 
-Quand une offre correspond, le script envoie une notification push via ntfy
-(app iPhone gratuite) et, si NTFY_EMAIL est renseigné, un e-mail en plus.
+Quand une offre correspond, le script vous prévient sur Telegram (et sur ntfy si
+un canal est configuré).
 
-Réglages (variables d'environnement) :
-  NTFY_TOPIC   obligatoire : nom secret de votre canal ntfy
-  NTFY_EMAIL   facultatif  : adresse qui reçoit aussi les alertes par e-mail
-  PRIX_MAX     facultatif  : prix maximum en euros (760 par défaut)
-  MODE_TEST    facultatif  : "true" pour recevoir un récapitulatif même sans offre
+Réglages (secrets GitHub ou variables d'environnement) :
+  TELEGRAM_TOKEN    jeton donné par @BotFather
+  TELEGRAM_CHAT_ID  facultatif : trouvé tout seul si vous avez écrit à votre bot
+  NTFY_TOPIC        facultatif : canal ntfy, en plus de Telegram
+  PRIX_MAX          prix maximum en euros (760 par défaut)
+  RESUME_HEURE      heure du point quotidien, heure de Paris (9 par défaut, "non" = aucun)
+  MODE_TEST         "true" pour recevoir un bilan même sans offre
 
 Pourquoi un vrai navigateur : sur une fiche Back Market, le prix affiché à côté
 d'un état appartient souvent à une autre configuration (ex. un 128 Go eSIM moins
 cher). Le script clique donc sur l'état, relit ce qui est réellement proposé et,
 si ce n'est pas la bonne config, remet « 256 Go » puis « SIM physique + eSIM »
-pour trouver le vrai prix de la bonne version. Il n'alerte que sur une offre
-dont le récapitulatif confirme état, stockage et SIM.
+pour trouver le vrai prix de la bonne version. Il n'alerte que si le récapitulatif
+de la fiche (état, batterie, stockage, SIM, coloris, prix) concorde avec le titre et
+le prix affichés en haut de la fiche.
 """
 
+import html
 import json
 import os
 import random
@@ -54,14 +58,30 @@ if os.environ.get("BM_PRODUITS"):  # remplace la liste (tests)
 
 # --- Notifications et mémoire ------------------------------------------------
 
-NTFY_SERVEUR = (os.environ.get("NTFY_SERVEUR") or "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC = (os.environ.get("NTFY_TOPIC") or "").strip()
-NTFY_EMAIL = (os.environ.get("NTFY_EMAIL") or "").strip()
+try:  # le workflow transmet tous les secrets d'un coup (SECRETS_JSON)
+    SECRETS = json.loads(os.environ.get("SECRETS_JSON") or "{}") or {}
+except ValueError:
+    SECRETS = {}
+
+
+def reglage(nom, defaut=""):
+    valeur = os.environ.get(nom) or SECRETS.get(nom) or defaut
+    return valeur.strip() if isinstance(valeur, str) else valeur
+
+
+TELEGRAM_API = reglage("TELEGRAM_API", "https://api.telegram.org").rstrip("/")
+TELEGRAM_TOKEN = reglage("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = reglage("TELEGRAM_CHAT_ID")
+NTFY_SERVEUR = reglage("NTFY_SERVEUR", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = reglage("NTFY_TOPIC")
+RESUME_HEURE = reglage("RESUME_HEURE", "9")
 MODE_TEST = (os.environ.get("MODE_TEST") or "").strip().lower() in ("1", "true", "oui", "yes")
 FICHIER_MEMOIRE = Path(os.environ.get("FICHIER_MEMOIRE") or "state.json")
 RYTHME = float(os.environ.get("BM_RYTHME") or 1)  # < 1 pour raccourcir les pauses (tests)
 
-MOTIF_PRIX = r"(\d{1,3}(?:[\s\u00a0\u202f]?\d{3})*,\d{2})[\s\u00a0\u202f]*€"
+# (?<!…) : un prix ne commence pas juste après « 4,5/ » (la note), une virgule ou un chiffre
+MOTIF_PRIX = r"(?<![\d,./])(\d{1,3}(?:[\s\u00a0\u202f]?\d{3})*,\d{2})[\s\u00a0\u202f]*€"
+PRIX_VRAISEMBLABLES = (100, 3000)  # au-delà : erreur de lecture, pas un prix d'iPhone
 
 
 # --- Outils texte ------------------------------------------------------------
@@ -73,6 +93,10 @@ def normaliser(texte):
 
 def en_euros(chaine):
     return float(re.sub(r"[\s\u00a0\u202f]", "", chaine).replace(",", "."))
+
+
+def vraisemblable(prix):
+    return PRIX_VRAISEMBLABLES[0] <= prix <= PRIX_VRAISEMBLABLES[1]
 
 
 def euros(valeur):
@@ -97,9 +121,13 @@ def prix_de_la_zone(texte, titre_zone, libelles, repli=False):
     prix = {}
     for i, (pos, libelle) in enumerate(reperes):
         fin = reperes[i + 1][0] if i + 1 < len(reperes) else len(zone)
-        morceau = zone[pos + len(libelle):fin][:60]  # jamais au-delà de l'option suivante
-        m = re.search(MOTIF_PRIX, morceau)
-        if m and libelle not in prix:
+        # Le prix suit immédiatement l'option (jamais au-delà de l'option suivante) ;
+        # « Déjà vendu » = pas de prix, même si un autre montant suit (ex. « Jusqu'à 150 € … »)
+        morceau = zone[pos + len(libelle):fin][:40]
+        if re.match(r"\s*(Déjà vendu|Indisponible|Épuisé)", morceau, re.I):
+            continue
+        m = re.match(r"\s*.{0,15}?" + MOTIF_PRIX, morceau)
+        if m and libelle not in prix and vraisemblable(en_euros(m.group(1))):
             prix[libelle] = en_euros(m.group(1))
     return prix
 
@@ -247,6 +275,8 @@ def blocs_prix(texte):
     depuis le prix précédent (sinon on capterait les sélecteurs voisins)."""
     blocs = []
     for m in re.finditer(MOTIF_PRIX + " avant reprise", texte):
+        if not vraisemblable(en_euros(m.group(1))):
+            continue
         debut = max(texte.rfind("€", 0, m.start()) + 1, m.start() - 200)
         blocs.append((en_euros(m.group(1)), texte[debut:m.start()].strip()))
     return blocs
@@ -318,34 +348,62 @@ def cliquer_option(page, libelle):
     return infos, methode, changement
 
 
-def lire_config(page):
-    """Ce que la fiche propose vraiment : état, stockage, SIM, coloris, prix.
-    Source principale : le récapitulatif « État · Batterie · 256 Go · SIM · Coloris · prix »."""
+def attributs(texte):
+    """(stockage, SIM, coloris) mentionnés dans un texte."""
+    stockage = re.search(MOTIF_STOCKAGE, texte)
+    couleur = re.search(r"Titane (noir|naturel|sable|blanc)", texte, re.I)
+    return (f"{stockage.group(1)} Go" if stockage else None,
+            next((x for x in SIMS if x in texte), None),
+            couleur.group(0).capitalize() if couleur else None)
+
+
+def lire_config_une_fois(page):
     vue = instantane(page)
     titre, blocs = vue["titre"], vue["blocs"]
     motif_etats = "|".join(map(re.escape, TOUS_LES_ETATS))
-    recap = None
-    for prix, avant in blocs:
-        if re.search(motif_etats, avant) and re.search(MOTIF_STOCKAGE, avant):
-            recap = (prix, avant)
-    source = recap[1] if recap else titre
-    etat = re.search(motif_etats, recap[1]).group(0) if recap else None
-    stockage = re.search(MOTIF_STOCKAGE, source)
-    couleur = re.search(r"Titane (noir|naturel|sable|blanc)", source, re.I)
-    return {
-        "etat": etat,
-        "stockage": f"{stockage.group(1)} Go" if stockage else None,
-        "sim": next((x for x in SIMS if x in source), None),
-        "couleur": couleur.group(0).capitalize() if couleur else None,
-        "prix": recap[0] if recap else vue["entete"],
-        "certain": recap is not None,
-        "titre": titre, "url": page.url,
-        "recap": recap[1][-110:] if recap else "",
-    }
+    candidats = [(p, a) for p, a in blocs
+                 if re.search(motif_etats, a) and re.search(MOTIF_STOCKAGE, a)]
+    # Le récapitulatif de la fiche cite la batterie (« Batterie standard ») ; les cartes
+    # « Vous aimerez aussi » non. À défaut, le premier bloc (le récap précède ces cartes).
+    recap = next((c for c in candidats if "Batterie" in c[1]), candidats[0] if candidats else None)
+    t_stockage, t_sim, t_couleur = attributs(titre)  # le titre = identité du produit affiché
+    cfg = {"etat": None, "stockage": t_stockage, "sim": t_sim, "couleur": t_couleur,
+           "prix": vue["entete"], "certain": False, "coherent": True,
+           "titre": titre, "url": page.url, "recap": ""}
+    if not recap:
+        return cfg
+    prix, segment = recap
+    # Ne lire que la liste du récapitulatif : à partir du dernier état cité
+    etat = None
+    for m in re.finditer(motif_etats, segment):
+        etat, depart = m.group(0), m.start()
+    liste = segment[depart:]
+    r_stockage, r_sim, r_couleur = attributs(liste)
+    coherent = all(t is None or r == t for r, t in
+                   ((r_stockage, t_stockage), (r_sim, t_sim), (r_couleur, t_couleur)))
+    if vue["entete"] is not None and abs(vue["entete"] - prix) > 0.005:
+        coherent = False  # le prix en haut de fiche doit être celui du récapitulatif
+    cfg.update(etat=etat, stockage=r_stockage or t_stockage, sim=r_sim or t_sim,
+               couleur=t_couleur or r_couleur, prix=prix, certain=True, coherent=coherent,
+               recap=liste[-110:])
+    return cfg
+
+
+def lire_config(page):
+    """Ce que la fiche propose vraiment. Le récapitulatif (état, batterie, stockage, SIM,
+    coloris, prix) doit concorder avec le titre et le prix en haut de fiche ; sinon on relit
+    une fois (la page peut être en cours de mise à jour)."""
+    cfg = lire_config_une_fois(page)
+    if not cfg["coherent"]:
+        page.wait_for_timeout(int(2500 * max(RYTHME, 0.3)))
+        cfg = lire_config_une_fois(page)
+        if not cfg["coherent"]:
+            print(f"      ⚠ lecture incohérente : titre « {cfg['titre']} » / récap « {cfg['recap']} »")
+    return cfg
 
 
 def bonne_config(cfg):
-    return cfg["stockage"] == STOCKAGE and cfg["sim"] == SIM
+    return cfg["stockage"] == STOCKAGE and cfg["sim"] == SIM and cfg.get("coherent", True)
 
 
 def est_cible(cfg, etat):
@@ -355,7 +413,8 @@ def est_cible(cfg, etat):
 def decrire(cfg):
     sim = {"SIM physique + eSIM": "SIM + eSIM"}.get(cfg["sim"], cfg["sim"] or "?")
     return (f"{cfg['etat'] or '?'}, {cfg['stockage'] or '?'} {sim}, "
-            f"{cfg['couleur'] or '?'}, {euros(cfg['prix'])}")
+            f"{cfg['couleur'] or '?'}, {euros(cfg['prix'])}"
+            + ("" if cfg.get("coherent", True) else " (incohérent)"))
 
 
 def ajuster(page, etat, cfg):
@@ -376,11 +435,12 @@ def ajuster(page, etat, cfg):
         if infos and changement:
             cfg = lire_config(page)
             etapes.append(f"{etat} → {decrire(cfg)}")
-    trouvees = []
+    trouvees, coloris = [], {}
     if est_cible(cfg, etat):
         trouvees.append(cfg)
         # Les autres coloris dans cette config : on vérifie ceux affichés sous le plafond
-        for couleur, prix in prix_des_coloris(normaliser(page.inner_text("body"))).items():
+        coloris = prix_des_coloris(normaliser(page.inner_text("body")))
+        for couleur, prix in coloris.items():
             if couleur == cfg["couleur"] or prix > PRIX_MAX:
                 continue
             infos, _, changement = cliquer_option(page, couleur)
@@ -391,7 +451,7 @@ def ajuster(page, etat, cfg):
                     trouvees.append(autre)
     for e in etapes:
         print(f"      ajustement : {e}")
-    return {"offres": trouvees, "etapes": etapes}
+    return {"offres": trouvees, "etapes": etapes, "coloris": coloris}
 
 
 def verdict_bonne_config(cfg, couleur_fiche):
@@ -401,7 +461,7 @@ def verdict_bonne_config(cfg, couleur_fiche):
     return f"{euros(cfg['prix'])} bonne config mais trop cher{autre}"
 
 
-def verifier_coloris(page, couleur, url, ajustements):
+def verifier_coloris(page, couleur, url, ajustements, vus):
     r = {"couleur": couleur, "url": url, "statut": "", "selecteur": {}, "offres": [],
          "verdicts": {}, "defaut": None}
     r["statut"] = ouvrir(page, url)
@@ -432,6 +492,11 @@ def verifier_coloris(page, couleur, url, ajustements):
         if affiche > PRIX_MAX:  # Back Market affiche le moins cher : rien en dessous
             r["verdicts"][etat] = f"{euros(affiche)} affiché, trop cher"
             continue
+        deja_vu = vus.get((etat, affiche))
+        if deja_vu and not est_cible(deja_vu, etat):  # même offre mise en avant qu'ailleurs
+            r["verdicts"][etat] = f"{euros(affiche)} = {deja_vu['stockage'] or '?'} {deja_vu['sim'] or '?'}"
+            print(f"    {etat} (affiché {euros(affiche)}) : déjà vu, {decrire(deja_vu)}")
+            continue
         if not fraiche:  # repartir de la fiche d'origine
             pause(2, 4)
             if ouvrir(page, url) != "ok":
@@ -447,6 +512,8 @@ def verifier_coloris(page, couleur, url, ajustements):
             cfg["etat"] = etat  # pas de récapitulatif lisible : titre + prix concordants
         print(f"    {etat} (affiché {euros(affiche)}) : {methode} → "
               f"{changement or 'aucun changement'} ⇒ {decrire(cfg)}")
+        if changement:
+            vus[(etat, affiche)] = cfg
         if est_cible(cfg, etat):
             r["offres"].append(cfg)
             r["verdicts"][etat] = verdict_bonne_config(cfg, couleur)
@@ -488,7 +555,7 @@ def verifier():
     except ImportError:
         print("❌ Playwright manque : lancez « pip install playwright ».")
         sys.exit(1)
-    resultats, ajustements = {}, {}
+    resultats, ajustements, vus = {}, {}, {}
     with sync_playwright() as p:
         navigateur, contexte = lancer_chrome(p)
         page = contexte.new_page()
@@ -505,7 +572,7 @@ def verifier():
                     pause(3, 7)
                 print(f"- {couleur}")
                 try:
-                    r = verifier_coloris(page, couleur, url, ajustements)
+                    r = verifier_coloris(page, couleur, url, ajustements, vus)
                 except Exception as e:
                     r = {"couleur": couleur, "url": url, "selecteur": {}, "offres": [],
                          "verdicts": {}, "defaut": None,
@@ -514,18 +581,70 @@ def verifier():
                 if r["statut"] != "ok":
                     print(f"  ⇒ {r['statut']}")
         navigateur.close()
-    return [resultats[c] for c, _ in PRODUITS.items()], ajustements
+    return [resultats[c] for c, _ in PRODUITS.items()], ajustements, vus
 
 
 # --- Notifications -----------------------------------------------------------
 
-EMAIL_REFUSE = False
+def appel_http(url, donnees=None, timeout=20):
+    """POST JSON (ou GET si donnees est None). Renvoie (code, corps décodé)."""
+    corps = json.dumps(donnees).encode("utf-8") if donnees is not None else None
+    requete = urllib.request.Request(url, data=corps, method="POST" if corps else "GET",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(requete, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8") or "{}")
+        except ValueError:
+            return e.code, {}
+    except Exception as e:
+        return 0, {"description": str(e)}
 
 
-def notifier(titre, message, priorite=3, lien=None, tags=None):
-    global EMAIL_REFUSE
+def trouver_chat_telegram(memoire):
+    """Identifiant de la conversation : secret, sinon mémoire, sinon dernier message reçu par le bot."""
+    if TELEGRAM_CHAT_ID:
+        return TELEGRAM_CHAT_ID, "secret"
+    if memoire.get("telegram_chat_id"):
+        return str(memoire["telegram_chat_id"]), "mémoire"
+    code, rep = appel_http(f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/getUpdates")
+    if code == 401:
+        print("❌ Telegram refuse le jeton : vérifiez le secret TELEGRAM_TOKEN.")
+        return None, "jeton refusé"
+    for maj in reversed(rep.get("result") or []):
+        message = maj.get("message") or maj.get("my_chat_member") or {}
+        chat = message.get("chat") or {}
+        if chat.get("id") is not None:
+            memoire["telegram_chat_id"] = chat["id"]
+            return str(chat["id"]), "trouvé"
+    print("❌ Telegram : aucun message reçu par le bot. Ouvrez votre bot, touchez « Démarrer » "
+          "(ou envoyez-lui un message), puis relancez.")
+    return None, "introuvable"
+
+
+CANAUX = {"telegram": None}  # rempli par main() : identifiant de conversation Telegram
+
+
+def envoyer_telegram(titre, message, lien=None, silencieux=False):
+    chat = CANAUX.get("telegram")
+    if not (TELEGRAM_TOKEN and chat):
+        return False
+    texte = f"<b>{html.escape(titre, quote=False)}</b>\n{html.escape(message, quote=False)}"
+    donnees = {"chat_id": chat, "text": texte[:4000], "parse_mode": "HTML",
+               "disable_web_page_preview": True, "disable_notification": silencieux}
+    if lien:
+        donnees["reply_markup"] = {"inline_keyboard": [[{"text": "Ouvrir Back Market", "url": lien}]]}
+    code, rep = appel_http(f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage", donnees)
+    if code == 200 and rep.get("ok"):
+        return True
+    print(f"  Telegram a répondu {code} : {str(rep.get('description', rep))[:200]}")
+    return False
+
+
+def envoyer_ntfy(titre, message, priorite=3, lien=None, tags=None):
     if not NTFY_TOPIC:
-        print(f"  (pas de NTFY_TOPIC, notification non envoyée : {titre})")
         return False
     donnees = {"topic": NTFY_TOPIC, "title": titre, "message": message, "priority": priorite}
     if tags:
@@ -533,27 +652,19 @@ def notifier(titre, message, priorite=3, lien=None, tags=None):
     if lien:
         donnees["click"] = lien
         donnees["actions"] = [{"action": "view", "label": "Ouvrir Back Market", "url": lien}]
-    essais = ([dict(donnees, email=NTFY_EMAIL), donnees] if NTFY_EMAIL and not EMAIL_REFUSE
-              else [donnees])
-    for n, corps in enumerate(essais):
-        requete = urllib.request.Request(
-            NTFY_SERVEUR + "/", data=json.dumps(corps).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(requete, timeout=20):
-                pass
-            if n:
-                EMAIL_REFUSE = True
-                print("  E-mail refusé par ntfy (compte requis) : notification envoyée sans e-mail. "
-                      "Vous pouvez supprimer le secret NTFY_EMAIL.")
-            print(f"  Notification envoyée : {titre}")
-            return True
-        except urllib.error.HTTPError as e:
-            print(f"  ntfy a répondu {e.code} : {e.read().decode('utf-8', 'replace')[:200]}")
-        except Exception as e:
-            print(f"  Échec de l'envoi ntfy : {e}")
-            return False
+    code, rep = appel_http(NTFY_SERVEUR + "/", donnees)
+    if 200 <= code < 300:
+        return True
+    print(f"  ntfy a répondu {code} : {str(rep)[:200]}")
     return False
+
+
+def notifier(titre, message, priorite=3, lien=None, tags=None, silencieux=False):
+    envois = [nom for nom, ok in (
+        ("Telegram", envoyer_telegram(titre, message, lien, silencieux)),
+        ("ntfy", envoyer_ntfy(titre, message, priorite, lien, tags))) if ok]
+    print(f"  Notification {'envoyée (' + ', '.join(envois) + ')' if envois else 'NON envoyée'} : {titre}")
+    return bool(envois)
 
 
 # --- Mémoire (pour ne pas répéter la même alerte) ------------------------------
@@ -568,56 +679,93 @@ def charger_memoire():
 ABREGE = {"Très bon état": "Très bon", "Parfait état": "Parfait"}
 
 
-def lignes_bilan(resultats, ajustements):
-    """Bilan lisible, par coloris puis pour la recherche en 256 Go SIM physique + eSIM."""
-    lignes = []
+def court(couleur):
+    return (couleur or "?").replace("Titane ", "")
+
+
+def lignes_bilan(resultats, ajustements, vus):
+    """Bilan lisible : prix des fiches, puis pour chaque état le vrai prix en 256 Go SIM + eSIM."""
+    fiches = []
     for r in resultats:
-        if r["statut"] != "ok":
-            lignes.append(f"{r['couleur']} : {r['statut']}")
-            continue
-        details = [f"{ABREGE[e]} {r['verdicts'].get(e, '—')}" for e in ETATS_VOULUS]
         d = r["defaut"]
-        fiche = f" (fiche : {d['etat']} {euros(d['prix'])})" if d and d["etat"] else ""
-        lignes.append(f"{r['couleur']}{fiche} : " + " ; ".join(details))
+        if r["statut"] != "ok":
+            fiches.append(f"{court(r['couleur'])} {r['statut']}")
+        elif d and d["prix"] is not None:
+            fiches.append(f"{court(r['couleur'])} {euros(d['prix'])}" + (f" ({d['etat']})" if d["etat"] else ""))
+    lignes = ["Fiches 256 Go SIM + eSIM : " + ", ".join(fiches)]
     verifiees = [o for r in resultats for o in r["offres"]]
     verifiees += [o for a in ajustements.values() for o in a["offres"]]
     for etat in ETATS_VOULUS:
-        bonnes = [o for o in verifiees if est_cible(o, etat) and o["prix"] is not None]
-        if bonnes:
-            o = min(bonnes, key=lambda o: o["prix"])
-            txt = f"{euros(o['prix'])} ({o['couleur'] or '?'})"
-        else:
-            txt = "aucune trouvée"
-        lignes.append(f"Meilleur {ABREGE[etat]} en {STOCKAGE} {SIM} : {txt}")
+        bonnes = {}
+        for o in verifiees:
+            if est_cible(o, etat) and o["prix"] is not None:
+                c = court(o["couleur"])
+                bonnes[c] = min(o["prix"], bonnes.get(c, o["prix"]))
+        morceaux = [", ".join(f"{c} {euros(p)} vérifié" for c, p in sorted(bonnes.items(), key=lambda t: t[1]))] if bonnes else []
+        a = ajustements.get(etat) or {}
+        affiches = [f"{court(c)} {euros(p)}" for c, p in (a.get("coloris") or {}).items()
+                    if court(c) not in bonnes]
+        if affiches:
+            morceaux.append(", ".join(affiches) + " affiché(s)")
+        if not morceaux:
+            vus_ici = [r["selecteur"].get(etat) for r in resultats if r["statut"] == "ok"]
+            vus_ici = [v for v in vus_ici if v is not None]
+            if vus_ici and min(vus_ici) > PRIX_MAX:
+                morceaux.append(f"tout est au-dessus ({euros(min(vus_ici))} minimum)")
+            else:
+                morceaux.append("aucune trouvée")
+        ligne = f"{ABREGE[etat]} en 256 Go SIM + eSIM : " + " ; ".join(morceaux)
+        promus = sorted({(v["prix"], v["stockage"], v["sim"]) for (e, _), v in vus.items()
+                         if e == etat and not est_cible(v, e) and v["prix"] is not None})
+        if promus:
+            ligne += " (mis en avant : " + ", ".join(
+                f"{st or '?'} {si or '?'} {euros(px)}" for px, st, si in promus) + ")"
+        lignes.append(ligne)
     return lignes
 
 
-def resume_github(resultats, ajustements, trouvees):
+def resume_github(resultats, ajustements, vus, trouvees):
     chemin = os.environ.get("GITHUB_STEP_SUMMARY")
     if not chemin:
         return
     lignes = ["### Veille Back Market", "",
               f"Cible : iPhone 16 Pro {STOCKAGE}, {SIM}, Très bon ou Parfait état, "
               f"{euros(PRIX_MAX)} maximum.", ""]
-    lignes += [f"- {l}" for l in lignes_bilan(resultats, ajustements)]
+    lignes += [f"- {l}" for l in lignes_bilan(resultats, ajustements, vus)]
     lignes += ["", f"Offres valides : {len(trouvees)}"]
     with open(chemin, "a", encoding="utf-8") as f:
         f.write("\n".join(lignes) + "\n")
 
 
+def maintenant_paris():
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Paris"))
+    except Exception:  # base de fuseaux absente : approximation heure d'été
+        return datetime.now(timezone(timedelta(hours=2)))
+
+
 def main():
     print(f"Veille : iPhone 16 Pro {STOCKAGE}, {SIM}, "
           f"{' ou '.join(ETATS_VOULUS)}, {euros(PRIX_MAX)} maximum")
-    if not NTFY_TOPIC:
-        print("❌ Le secret NTFY_TOPIC n'est pas défini : aucune notification possible.")
+    if not (TELEGRAM_TOKEN or NTFY_TOPIC):
+        print("❌ Aucun canal : ajoutez le secret TELEGRAM_TOKEN (ou NTFY_TOPIC).")
         if os.environ.get("GITHUB_ACTIONS"):
             sys.exit(1)
 
     memoire = charger_memoire()
     avant = json.dumps(memoire, sort_keys=True)
     deja = set(memoire.get("actives", []))
+    memoire.pop("email_refuse", None)  # ancienne option e-mail, abandonnée
 
-    resultats, ajustements = verifier()
+    chat_trouve = None
+    if TELEGRAM_TOKEN:
+        CANAUX["telegram"], origine = trouver_chat_telegram(memoire)
+        chat_trouve = CANAUX["telegram"] if origine == "trouvé" else None
+        print(f"Telegram : conversation {CANAUX['telegram'] or '—'} ({origine})")
+
+    resultats, ajustements, vus = verifier()
 
     # Toutes les offres dont la config a été vérifiée (fiches + ajustements)
     trouvees = {}
@@ -632,7 +780,7 @@ def main():
     for cle, o in sorted(trouvees.items(), key=lambda kv: kv[1]["prix"]):
         if cle in deja:
             continue
-        verif = ("Config vérifiée sur la fiche." if o["certain"]
+        verif = ("Config vérifiée : récapitulatif, titre et prix concordent." if o["certain"]
                  else "Vérifiez l'état et la SIM sur la fiche avant de payer.")
         notifier(f"iPhone 16 Pro à {euros(o['prix'])} sur Back Market",
                  f"{o['etat']}, {o['couleur']}, {STOCKAGE}, {SIM}\n{verif}",
@@ -642,38 +790,55 @@ def main():
     aucune_lue = not any(r["statut"] == "ok" for r in resultats)
     memoire["actives"] = sorted(set(trouvees) if toutes_lues else set(trouvees) | deja)
 
-    # Panne (blocage, page changée…) : une seule alerte, puis une quand ça repart
-    statuts = ", ".join(f"{r['couleur']} : {r['statut']}" for r in resultats)
+    # Panne : signalée après 2 passages ratés d'affilée (un blocage isolé est courant)
+    statuts = ", ".join(f"{court(r['couleur'])} : {r['statut']}" for r in resultats)
     if aucune_lue:
-        if not memoire.get("panne_signalee") and not MODE_TEST:
+        memoire["echecs"] = memoire.get("echecs", 0) + 1
+        if memoire["echecs"] >= 2 and not memoire.get("panne_signalee") and not MODE_TEST:
             notifier("Veille Back Market en panne",
-                     f"Aucune fiche n'a pu être lue ({statuts}). "
+                     f"Aucune fiche lue depuis {memoire['echecs']} passages ({statuts}). "
                      "Cette alerte n'est envoyée qu'une fois.", priorite=3, tags=["warning"])
-        memoire["panne_signalee"] = True
+            memoire["panne_signalee"] = True
     else:
+        memoire["echecs"] = 0
         if memoire.get("panne_signalee"):
             notifier("Veille Back Market : c'est reparti",
                      "Les fiches sont de nouveau lisibles.", priorite=2,
-                     tags=["white_check_mark"])
+                     tags=["white_check_mark"], silencieux=True)
         memoire["panne_signalee"] = False
 
-    bilan = lignes_bilan(resultats, ajustements)
+    bilan = lignes_bilan(resultats, ajustements, vus)
     print("Bilan :\n  " + "\n  ".join(bilan))
-    if MODE_TEST:
-        conclusion = (f"\nOffres valides : " + ", ".join(
-            f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values())
-            if trouvees else f"\nAucune offre valide à {euros(PRIX_MAX)} ou moins.")
-        lues = sum(r["statut"] == "ok" for r in resultats)
-        notifier(f"Test : {lues}/{len(resultats)} fiches lues", "\n".join(bilan) + conclusion,
-                 priorite=3, tags=["test_tube"])
+    conclusion = ("\nOffres valides : " + ", ".join(
+        f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values())
+        if trouvees else f"\nAucune offre valide à {euros(PRIX_MAX)} ou moins.")
+    lues = sum(r["statut"] == "ok" for r in resultats)
 
-    resume_github(resultats, ajustements, trouvees)
+    if MODE_TEST:
+        corps = "\n".join(bilan) + conclusion
+        if chat_trouve:
+            corps += (f"\n\nVotre identifiant Telegram est {chat_trouve}. Ajoutez-le en secret "
+                      "TELEGRAM_CHAT_ID pour que les alertes ne dépendent plus de la mémoire.")
+        notifier(f"Test : {lues}/{len(resultats)} fiches lues", corps,
+                 priorite=3, tags=["test_tube"])
+    elif RESUME_HEURE.isdigit():  # point quotidien discret, au premier passage après l'heure choisie
+        heure = maintenant_paris()
+        jour = heure.strftime("%Y-%m-%d")
+        if heure.hour >= int(RESUME_HEURE) and memoire.get("resume_du") != jour:
+            if notifier(f"Veille Back Market : point du jour ({lues}/{len(resultats)} fiches lues)",
+                        "\n".join(bilan) + conclusion, priorite=2, tags=["calendar"],
+                        silencieux=True):
+                memoire["resume_du"] = jour
+
+    resume_github(resultats, ajustements, vus, trouvees)
     FICHIER_MEMOIRE.write_text(json.dumps(memoire, ensure_ascii=False, indent=1), encoding="utf-8")
     change = json.dumps(memoire, sort_keys=True) != avant
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
             f.write(f"changed={'true' if change else 'false'}\n")
     print(f"Terminé : {len(trouvees)} offre(s) valide(s).")
+    if TELEGRAM_TOKEN and not CANAUX.get("telegram") and MODE_TEST:
+        sys.exit(1)  # test en rouge : Telegram n'est pas encore relié
 
 
 if __name__ == "__main__":
