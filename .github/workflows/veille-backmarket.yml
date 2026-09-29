@@ -45,8 +45,9 @@ jobs:
       - name: Vérifier Back Market
         id: veille
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          NTFY_EMAIL: ${{ secrets.NTFY_EMAIL }}
+          # Tous les secrets du dépôt (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC…) :
+          # plus besoin de modifier ce fichier pour en ajouter un.
+          SECRETS_JSON: ${{ toJSON(secrets) }}
           PRIX_MAX: "760"
           MODE_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
         run: xvfb-run -a python watch.py
