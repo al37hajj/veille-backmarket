@@ -742,6 +742,29 @@ def lignes_bilan(resultats, ajustements, vus):
     return lignes
 
 
+def lignes_releve(resultats, ajustements):
+    """Prix de la config cherchée relevés à ce passage (pour historique.py)."""
+    lignes = []
+    for r in resultats:
+        d = r.get("defaut")
+        if r["statut"] == "ok" and d and d["etat"] and d["prix"] is not None and bonne_config(d):
+            lignes.append({"etat": d["etat"], "couleur": court(d["couleur"] or r["couleur"]),
+                           "prix": d["prix"], "type": "fiche"})
+    verifiees = [o for r in resultats for o in r["offres"]]
+    verifiees += [o for a in ajustements.values() for o in a["offres"]]
+    for etat in ETATS_VOULUS:
+        bonnes = {}
+        for o in verifiees:
+            if est_cible(o, etat) and o["prix"] is not None:
+                c = court(o["couleur"])
+                bonnes[c] = min(o["prix"], bonnes.get(c, o["prix"]))
+        lignes += [{"etat": etat, "couleur": c, "prix": p, "type": "vérifié"} for c, p in bonnes.items()]
+        for c, p in ((ajustements.get(etat) or {}).get("coloris") or {}).items():
+            if court(c) not in bonnes:
+                lignes.append({"etat": etat, "couleur": court(c), "prix": p, "type": "affiché"})
+    return lignes
+
+
 def resume_github(resultats, ajustements, vus, trouvees):
     chemin = os.environ.get("GITHUB_STEP_SUMMARY")
     if not chemin:
@@ -832,6 +855,7 @@ def main():
         if trouvees else f"\nAucune offre valide à {euros(PRIX_MAX)} ou moins.")
     lues = sum(r["statut"] == "ok" for r in resultats)
 
+    point_du_jour = False
     if MODE_TEST:
         corps = "\n".join(bilan) + conclusion
         if chat_trouve:
@@ -847,8 +871,15 @@ def main():
                         "\n".join(bilan) + conclusion, priorite=2, tags=["calendar"],
                         silencieux=True):
                 memoire["resume_du"] = jour
+                point_du_jour = True
 
     resume_github(resultats, ajustements, vus, trouvees)
+    releve = {"horodatage": maintenant_paris().isoformat(timespec="minutes"),
+              "run_id": os.environ.get("GITHUB_RUN_ID") or "", "prix_max": PRIX_MAX,
+              "lignes": lignes_releve(resultats, ajustements), "point_du_jour": point_du_jour,
+              "test": MODE_TEST, "telegram_chat_id": CANAUX.get("telegram")}
+    Path(os.environ.get("FICHIER_RELEVE") or "releve.json").write_text(
+        json.dumps(releve, ensure_ascii=False, indent=1), encoding="utf-8")
     FICHIER_MEMOIRE.write_text(json.dumps(memoire, ensure_ascii=False, indent=1), encoding="utf-8")
     change = json.dumps(memoire, sort_keys=True) != avant
     if os.environ.get("GITHUB_OUTPUT"):
