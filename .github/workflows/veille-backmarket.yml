@@ -7,12 +7,17 @@ on:
   workflow_dispatch:          # bouton « Run workflow » pour tester
     inputs:
       test:
-        description: "Envoyer un récapitulatif même sans bonne affaire"
+        description: "Envoyer le bilan et le graphique même sans bonne affaire"
         type: boolean
         default: true
+      reconstituer:
+        description: "Récupérer les prix des passages précédents (à faire une fois)"
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write   # enregistrer historique.csv, historique.png et README.md
+  actions: read     # relire les logs des passages précédents
 
 concurrency:
   group: veille-backmarket
@@ -21,7 +26,7 @@ concurrency:
 jobs:
   veille:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -29,9 +34,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer Playwright
+      - name: Installer Playwright et matplotlib
         run: |
-          pip install --quiet playwright
+          pip install --quiet playwright matplotlib
           command -v xvfb-run >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
           command -v google-chrome >/dev/null || python -m playwright install --with-deps chromium
 
@@ -58,3 +63,26 @@ jobs:
         with:
           path: state.json
           key: veille-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Enregistrer l'historique des prix
+        if: always() && steps.veille.outcome != 'skipped'
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PRIX_MAX: "760"
+          RECONSTITUER: ${{ github.event_name == 'workflow_dispatch' && inputs.reconstituer }}
+        run: |
+          if [ "$RECONSTITUER" = "true" ]; then python historique.py reconstituer; fi
+          python historique.py ajouter
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add historique.csv
+          [ -f historique.png ] && git add historique.png README.md
+          if git diff --cached --quiet; then
+            echo "Historique inchangé."
+          else
+            git commit --quiet -m "Relevé de prix du $(TZ=Europe/Paris date '+%d/%m %Hh%M')"
+            git pull --rebase --quiet origin "$GITHUB_REF_NAME" || true
+            git push --quiet origin "HEAD:$GITHUB_REF_NAME"
+            echo "Historique enregistré dans le dépôt."
+          fi
