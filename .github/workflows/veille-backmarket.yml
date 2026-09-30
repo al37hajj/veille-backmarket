@@ -19,6 +19,10 @@ permissions:
   contents: write   # enregistrer historique.csv, historique.png et README.md
   actions: read     # relire les logs des passages précédents
 
+env:
+  PLAFOND_TRES_BON: "770"   # prix maximum en Très bon état
+  PLAFOND_PARFAIT: "790"    # prix maximum en Parfait état
+
 concurrency:
   group: veille-backmarket
   cancel-in-progress: false
@@ -53,7 +57,6 @@ jobs:
           # Tous les secrets du dépôt (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC…) :
           # plus besoin de modifier ce fichier pour en ajouter un.
           SECRETS_JSON: ${{ toJSON(secrets) }}
-          PRIX_MAX: "760"
           MODE_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
         run: xvfb-run -a python watch.py
 
@@ -69,7 +72,6 @@ jobs:
         env:
           SECRETS_JSON: ${{ toJSON(secrets) }}
           GITHUB_TOKEN: ${{ github.token }}
-          PRIX_MAX: "760"
           RECONSTITUER: ${{ github.event_name == 'workflow_dispatch' && inputs.reconstituer }}
         run: |
           if [ "$RECONSTITUER" = "true" ]; then python historique.py reconstituer; fi
