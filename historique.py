@@ -43,7 +43,7 @@ def reglage(nom, defaut=""):
     return valeur.strip() if isinstance(valeur, str) else valeur
 
 
-PRIX_MAX = float(reglage("PRIX_MAX", "760"))
+PLAFONDS = {"Très bon état": 770.0, "Parfait état": 790.0}  # repris de releve.json quand il existe
 TELEGRAM_API = reglage("TELEGRAM_API", "https://api.telegram.org").rstrip("/")
 TELEGRAM_TOKEN = reglage("TELEGRAM_TOKEN")
 GITHUB_API = reglage("GITHUB_API_URL", "https://api.github.com").rstrip("/")
@@ -260,7 +260,10 @@ def dessiner(lignes):
         derniers[nom] = prix[-1]
         ax.annotate(euros(prix[-1]), (dates[-1], prix[-1]), xytext=(6, 0),
                     textcoords="offset points", va="center", color=teinte, fontweight="bold")
-    ax.axhline(PRIX_MAX, ls="--", color="#cf222e", lw=1.5, label=f"Votre plafond : {euros(PRIX_MAX)}")
+    for etat, (nom, teinte) in ETATS.items():  # un plafond par état, de la couleur de sa courbe
+        if points[etat] and etat in PLAFONDS:
+            ax.axhline(PLAFONDS[etat], ls="--", color=teinte, lw=1.3, alpha=0.9,
+                       label=f"Plafond {nom} : {euros(PLAFONDS[etat])}")
     if any(v != "actuelle" for s in points.values() for _, _, v in s):
         ax.plot([], [], "o", color="gray", mfc="white", label="Points creux : ancienne version, moins fiable")
     ax.set_title("iPhone 16 Pro 256 Go SIM physique + eSIM\nprix le plus bas relevé à chaque passage",
@@ -269,7 +272,7 @@ def dessiner(lignes):
     ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0f} €"))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m\n%Hh", tz=fuseau))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8, tz=fuseau))
-    tous = [p[1] for s in points.values() for p in s] + [PRIX_MAX]
+    tous = [p[1] for s in points.values() for p in s] + [PLAFONDS[e] for e in ETATS if points[e] and e in PLAFONDS]
     marge = max(15, (max(tous) - min(tous)) * 0.12)
     ax.set_ylim(min(tous) - marge, max(tous) + marge)
     ax.grid(alpha=0.3)
@@ -284,10 +287,19 @@ def dessiner(lignes):
             "fin": max(p[0] for s in points.values() for p in s)}
 
 
+def texte_plafonds():
+    return ", ".join(f"{ETATS[e][0]} {euros(v)}" for e, v in PLAFONDS.items() if e in ETATS)
+
+
+def charger_plafonds(releve):
+    for etat, valeur in (releve.get("plafonds") or {}).items():
+        PLAFONDS[etat] = float(valeur)
+
+
 def resume_texte(infos):
     prix = " · ".join(f"{nom} {euros(v)}" for nom, v in infos["derniers"].items())
     return (f"{infos['passages']} passages du {infos['debut']:%d/%m %Hh%M} au {infos['fin']:%d/%m %Hh%M}. "
-            f"Derniers prix : {prix} (plafond {euros(PRIX_MAX)}).")
+            f"Derniers prix : {prix} (plafonds : {texte_plafonds()}).")
 
 
 def maj_readme(infos):
@@ -354,6 +366,7 @@ def ajouter():
     except Exception:
         releve = {}
         print("Aucun relevé pour ce passage (vérification interrompue).")
+    charger_plafonds(releve)
     lignes = charger_csv()
     run_id = str(releve.get("run_id") or releve.get("horodatage") or "")
     nouvelles = [{"horodatage": releve["horodatage"], "run_id": run_id, "etat": l["etat"],
@@ -370,6 +383,10 @@ def main():
     if commande == "reconstituer":
         reconstituer()
     elif commande == "dessiner":
+        try:
+            charger_plafonds(json.loads(FICHIER_RELEVE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
         publier(charger_csv(), chat_telegram({}))
     else:
         ajouter()

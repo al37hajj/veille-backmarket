@@ -10,7 +10,8 @@ Réglages (secrets GitHub ou variables d'environnement) :
   TELEGRAM_TOKEN    jeton donné par @BotFather
   TELEGRAM_CHAT_ID  facultatif : trouvé tout seul si vous avez écrit à votre bot
   NTFY_TOPIC        facultatif : canal ntfy, en plus de Telegram
-  PRIX_MAX          prix maximum en euros (760 par défaut)
+  PLAFOND_TRES_BON  prix maximum en Très bon état (770 € par défaut, voir PLAFONDS ci-dessous)
+  PLAFOND_PARFAIT   prix maximum en Parfait état (790 € par défaut)
   RESUME_HEURE      heure du point quotidien, heure de Paris (9 par défaut, "non" = aucun)
   MODE_TEST         "true" pour recevoir un bilan même sans offre
 
@@ -37,7 +38,15 @@ from pathlib import Path
 
 # --- Ce que l'on cherche -----------------------------------------------------
 
-PRIX_MAX = float(os.environ.get("PRIX_MAX") or 760)
+# Prix maximum par état : c'est ici qu'on les change
+PLAFONDS = {
+    "Très bon état": float(os.environ.get("PLAFOND_TRES_BON") or 770),
+    "Parfait état": float(os.environ.get("PLAFOND_PARFAIT") or 790),
+}
+
+
+def plafond(etat):
+    return PLAFONDS.get(etat, 0)  # autre état (ex. État correct) : jamais d'alerte
 ETATS_VOULUS = ("Très bon état", "Parfait état")
 TOUS_LES_ETATS = ("État correct", "Très bon état", "Parfait état", "Premium")
 STOCKAGE = "256 Go"
@@ -97,6 +106,10 @@ def en_euros(chaine):
 
 def vraisemblable(prix):
     return PRIX_VRAISEMBLABLES[0] <= prix <= PRIX_VRAISEMBLABLES[1]
+
+
+def texte_plafonds():
+    return ", ".join(f"{e.replace(' état', '')} {euros(v)}" for e, v in PLAFONDS.items())
 
 
 def euros(valeur):
@@ -441,7 +454,7 @@ def ajuster(page, etat, cfg):
         # Les autres coloris dans cette config : on vérifie ceux affichés sous le plafond
         coloris = prix_des_coloris(normaliser(page.inner_text("body")))
         for couleur, prix in coloris.items():
-            if couleur == cfg["couleur"] or prix > PRIX_MAX:
+            if couleur == cfg["couleur"] or prix > plafond(etat):
                 continue
             infos, _, changement = cliquer_option(page, couleur)
             if infos and changement:
@@ -456,7 +469,7 @@ def ajuster(page, etat, cfg):
 
 def verdict_bonne_config(cfg, couleur_fiche):
     autre = f" ({cfg['couleur']})" if cfg["couleur"] and cfg["couleur"] != couleur_fiche else ""
-    if cfg["prix"] is not None and cfg["prix"] <= PRIX_MAX:
+    if cfg["prix"] is not None and cfg["prix"] <= plafond(cfg["etat"]):
         return f"{euros(cfg['prix'])} ✓{autre}"
     return f"{euros(cfg['prix'])} bonne config mais trop cher{autre}"
 
@@ -489,7 +502,7 @@ def verifier_coloris(page, couleur, url, ajustements, vus):
         if affiche is None:
             r["verdicts"][etat] = "déjà vendu"
             continue
-        if affiche > PRIX_MAX:  # Back Market affiche le moins cher : rien en dessous
+        if affiche > plafond(etat):  # Back Market affiche le moins cher : rien en dessous
             r["verdicts"][etat] = f"{euros(affiche)} affiché, trop cher"
             continue
         deja_vu = vus.get((etat, affiche))
@@ -728,7 +741,7 @@ def lignes_bilan(resultats, ajustements, vus):
         if not morceaux:
             vus_ici = [r["selecteur"].get(etat) for r in resultats if r["statut"] == "ok"]
             vus_ici = [v for v in vus_ici if v is not None]
-            if vus_ici and min(vus_ici) > PRIX_MAX:
+            if vus_ici and min(vus_ici) > plafond(etat):
                 morceaux.append(f"tout est au-dessus ({euros(min(vus_ici))} minimum)")
             else:
                 morceaux.append("aucune trouvée")
@@ -771,7 +784,7 @@ def resume_github(resultats, ajustements, vus, trouvees):
         return
     lignes = ["### Veille Back Market", "",
               f"Cible : iPhone 16 Pro {STOCKAGE}, {SIM}, Très bon ou Parfait état, "
-              f"{euros(PRIX_MAX)} maximum.", ""]
+              f"plafonds : {texte_plafonds()}.", ""]
     lignes += [f"- {l}" for l in lignes_bilan(resultats, ajustements, vus)]
     lignes += ["", f"Offres valides : {len(trouvees)}"]
     with open(chemin, "a", encoding="utf-8") as f:
@@ -789,7 +802,7 @@ def maintenant_paris():
 
 def main():
     print(f"Veille : iPhone 16 Pro {STOCKAGE}, {SIM}, "
-          f"{' ou '.join(ETATS_VOULUS)}, {euros(PRIX_MAX)} maximum")
+          f"{' ou '.join(ETATS_VOULUS)}, plafonds : {texte_plafonds()}")
     if not (TELEGRAM_TOKEN or NTFY_TOPIC):
         print("❌ Aucun canal : ajoutez le secret TELEGRAM_TOKEN (ou NTFY_TOPIC).")
         if os.environ.get("GITHUB_ACTIONS"):
@@ -813,7 +826,7 @@ def main():
     offres = [o for r in resultats for o in r["offres"]]
     offres += [o for a in ajustements.values() for o in a["offres"]]
     for o in offres:
-        if o["prix"] is not None and o["prix"] <= PRIX_MAX and est_cible(o, o["etat"]):
+        if o["prix"] is not None and o["prix"] <= plafond(o["etat"]) and est_cible(o, o["etat"]):
             couleur = o["couleur"] or "?"
             trouvees[f"{couleur}|{o['etat']}|{o['prix']:.2f}"] = dict(o, couleur=couleur)
 
@@ -824,7 +837,8 @@ def main():
         verif = ("Config vérifiée : récapitulatif, titre et prix concordent." if o["certain"]
                  else "Vérifiez l'état et la SIM sur la fiche avant de payer.")
         notifier(f"iPhone 16 Pro à {euros(o['prix'])} sur Back Market",
-                 f"{o['etat']}, {o['couleur']}, {STOCKAGE}, {SIM}\n{verif}",
+                 f"{o['etat']}, {o['couleur']}, {STOCKAGE}, {SIM}\n"
+                 f"Votre plafond pour cet état : {euros(plafond(o['etat']))}.\n{verif}",
                  priorite=5, lien=o["url"], tags=["iphone", "moneybag"])
 
     toutes_lues = all(r["statut"] == "ok" for r in resultats)
@@ -852,7 +866,7 @@ def main():
     print("Bilan :\n  " + "\n  ".join(bilan))
     conclusion = ("\nOffres valides : " + ", ".join(
         f"{o['couleur']} {o['etat']} {euros(o['prix'])}" for o in trouvees.values())
-        if trouvees else f"\nAucune offre valide à {euros(PRIX_MAX)} ou moins.")
+        if trouvees else f"\nAucune offre sous vos plafonds ({texte_plafonds()}).")
     lues = sum(r["statut"] == "ok" for r in resultats)
 
     point_du_jour = False
@@ -875,7 +889,7 @@ def main():
 
     resume_github(resultats, ajustements, vus, trouvees)
     releve = {"horodatage": maintenant_paris().isoformat(timespec="minutes"),
-              "run_id": os.environ.get("GITHUB_RUN_ID") or "", "prix_max": PRIX_MAX,
+              "run_id": os.environ.get("GITHUB_RUN_ID") or "", "plafonds": PLAFONDS,
               "lignes": lignes_releve(resultats, ajustements), "point_du_jour": point_du_jour,
               "test": MODE_TEST, "telegram_chat_id": CANAUX.get("telegram")}
     Path(os.environ.get("FICHIER_RELEVE") or "releve.json").write_text(
