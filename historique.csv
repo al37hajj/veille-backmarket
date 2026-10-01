@@ -1020,3 +1020,14 @@ horodatage,run_id,etat,couleur,prix,type,version
 2026-10-01T16:28+02:00,36876293920,État correct,naturel,800.00,fiche,actuelle
 2026-10-01T16:28+02:00,36876293920,État correct,noir,820.00,fiche,actuelle
 2026-10-01T16:28+02:00,36876293920,État correct,sable,809.00,fiche,actuelle
+2026-10-01T16:54+02:00,36879729069,Parfait état,blanc,879.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,Parfait état,naturel,855.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,Parfait état,noir,919.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,Parfait état,sable,841.00,vérifié,actuelle
+2026-10-01T16:54+02:00,36879729069,Très bon état,blanc,831.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,Très bon état,naturel,869.00,vérifié,actuelle
+2026-10-01T16:54+02:00,36879729069,Très bon état,noir,869.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,Très bon état,sable,821.00,affiché,actuelle
+2026-10-01T16:54+02:00,36879729069,État correct,naturel,800.00,fiche,actuelle
+2026-10-01T16:54+02:00,36879729069,État correct,noir,820.00,fiche,actuelle
+2026-10-01T16:54+02:00,36879729069,État correct,sable,809.00,fiche,actuelle
