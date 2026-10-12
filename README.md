@@ -5,5 +5,5 @@
 
 ![Évolution du prix](historique.png)
 
-499 passages du 29/09 01h18 au 11/10 09h26. Derniers prix : Très bon 793 € · Parfait 845 € (plafonds : Très bon 770 €, Parfait 790 €). Données complètes : [historique.csv](historique.csv).
+545 passages du 29/09 01h18 au 12/10 09h07. Derniers prix : Très bon 795 € · Parfait 847 € (plafonds : Très bon 770 €, Parfait 790 €). Données complètes : [historique.csv](historique.csv).
 <!-- veille:fin -->
